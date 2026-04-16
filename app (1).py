@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Cookie, Request, Response, HTTPException, Header
+from fastapi import FastAPI, Cookie, Request, Response, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Annotated, Optional
@@ -7,7 +7,6 @@ import uuid
 import time
 import hmac
 import hashlib
-
 from models import UserCreate, Product, sample_products
 
 app = FastAPI(
@@ -19,28 +18,21 @@ USERS_DB = {
     "mihail": "secure1234",
     "admin": "adminpass"
 }
-
 active_sessions: dict = {}
 TOKEN_SECRET = "bookstore_secret_key_7x9"
-
-SESSION_TTL = 600
-SESSION_RENEW_AFTER = 360
-
+SESSION_TTL = 300
+SESSION_RENEW_AFTER = 180
 
 class LoginRequest(BaseModel):
     username: str
     password: str
 
-
-# 3.1
 @app.post("/create_user")
 def create_user(user: UserCreate):
     if user.age is not None and user.age <= 0:
         raise HTTPException(status_code=400, detail="Возраст должен быть положительным числом")
     return user
 
-
-# 3.2
 @app.get("/products/search")
 def search_products(keyword: str, category: Optional[str] = None, limit: int = 10):
     result = []
@@ -50,7 +42,6 @@ def search_products(keyword: str, category: Optional[str] = None, limit: int = 1
                 result.append(p)
     return result[:limit]
 
-
 @app.get("/product/{product_id}")
 def get_product(product_id: int):
     for p in sample_products:
@@ -58,35 +49,45 @@ def get_product(product_id: int):
             return p
     raise HTTPException(status_code=404, detail="Товар не найден")
 
-
-# 5.4
 class CommonHeaders(BaseModel):
-    user_agent: str
-    accept_language: str
+    user_agent: str = Header(alias="User-Agent")
+    accept_language: str = Header(alias="Accept-Language")
 
+@app.get("/headers")
+def get_headers(headers: CommonHeaders = Depends()):
+    return {
+        "User-Agent": headers.user_agent,
+        "Accept-Language": headers.accept_language
+    }
 
-# 5.1
+@app.get("/info")
+def get_info(request: Request, headers: CommonHeaders = Depends(), response: Response):
+    response.headers["X-Server-Time"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    return {
+        "message": "Добро пожаловать! Ваши заголовки успешно обработаны.",
+        "client_ip": request.client.host,
+        "headers": {
+            "User-Agent": headers.user_agent,
+            "Accept-Language": headers.accept_language,
+        }
+    }
+
 @app.post("/login")
 def login(data: LoginRequest, response: Response):
     if data.username not in USERS_DB or USERS_DB[data.username] != data.password:
         raise HTTPException(status_code=401, detail="Неверные учётные данные")
-
     token = str(uuid.uuid4())
     active_sessions[token] = data.username
-
     response.set_cookie(key="session_token", value=token, httponly=True)
     return {"message": "Аутентификация прошла успешно"}
-
 
 @app.get("/user")
 def get_user(session_token: Optional[str] = Cookie(default=None)):
     if session_token is None or session_token not in active_sessions:
-        return JSONResponse(status_code=401, content={"message": "Сессия не найдена или недействительна"})
+        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
     username = active_sessions[session_token]
     return {"username": username, "email": f"{username}@bookstore.ru"}
 
-
-# 5.2
 def compute_hmac(value: str) -> str:
     return hmac.new(TOKEN_SECRET.encode(), value.encode(), hashlib.sha256).hexdigest()
 
@@ -102,28 +103,23 @@ def validate_token(token: str) -> Optional[str]:
         return None
     return user_id
 
-
 @app.post("/login_signed")
 def login_signed(data: LoginRequest, response: Response):
     if data.username not in USERS_DB or USERS_DB[data.username] != data.password:
         raise HTTPException(status_code=401, detail="Неверные учётные данные")
-
     token = build_token(str(uuid.uuid4()))
     response.set_cookie(key="session_token", value=token, httponly=True, max_age=3600)
     return {"message": "Аутентификация прошла успешно"}
 
-
 @app.get("/profile")
 def get_profile(session_token: Optional[str] = Cookie(default=None)):
     if session_token is None:
-        return JSONResponse(status_code=401, content={"message": "Токен отсутствует"})
+        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
     user_id = validate_token(session_token)
     if user_id is None:
-        return JSONResponse(status_code=401, content={"message": "Токен недействителен"})
+        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
     return {"user_id": user_id, "email": "user@bookstore.ru"}
 
-
-# 5.3
 def build_expiring_token(user_id: str, ts: int) -> str:
     payload = f"{user_id}.{ts}"
     sig = hmac.new(TOKEN_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
@@ -139,52 +135,25 @@ def validate_expiring_token(token: str):
         return None, None
     return user_id, int(ts_str)
 
-
 @app.post("/login_advanced")
 def login_advanced(data: LoginRequest, response: Response):
     if data.username not in USERS_DB or USERS_DB[data.username] != data.password:
         raise HTTPException(status_code=401, detail="Неверные учётные данные")
-
     token = build_expiring_token(str(uuid.uuid4()), int(time.time()))
     response.set_cookie(key="session_token", value=token, httponly=True, secure=False, max_age=SESSION_TTL)
     return {"message": "Аутентификация прошла успешно"}
 
-
 @app.get("/profile_advanced")
-def get_profile_advanced(session_token: Optional[str] = Cookie(default=None), response: Response = None):
+def get_profile_advanced(session_token: Optional[str] = Cookie(default=None), response: Response = Depends()):
     if session_token is None:
-        return JSONResponse(status_code=401, content={"message": "Токен отсутствует"})
-
+        return JSONResponse(status_code=401, content={"message": "Invalid session"})
     user_id, issued_at = validate_expiring_token(session_token)
     if user_id is None:
-        return JSONResponse(status_code=401, content={"message": "Токен недействителен"})
-
+        return JSONResponse(status_code=401, content={"message": "Invalid session"})
     elapsed = int(time.time()) - issued_at
-
     if elapsed >= SESSION_TTL:
-        return JSONResponse(status_code=401, content={"message": "Сессия истекла, войдите снова"})
-
+        return JSONResponse(status_code=401, content={"message": "Session expired"})
     if elapsed >= SESSION_RENEW_AFTER:
         new_token = build_expiring_token(user_id, int(time.time()))
         response.set_cookie(key="session_token", value=new_token, httponly=True, secure=False, max_age=SESSION_TTL)
-
     return {"user_id": user_id, "email": "user@bookstore.ru"}
-
-
-@app.get("/headers")
-def get_headers(headers: Annotated[CommonHeaders, Header()]):
-    return {"User-Agent": headers.user_agent, "Accept-Language": headers.accept_language}
-
-
-@app.get("/info")
-def get_info(request: Request, headers: Annotated[CommonHeaders, Header()], response: Response):
-    response.headers["X-Server-Time"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-
-    return {
-        "message": "Запрос успешно обработан",
-        "client_ip": request.client.host,
-        "headers": {
-            "User-Agent": headers.user_agent,
-            "Accept-Language": headers.accept_language,
-        },
-    }
