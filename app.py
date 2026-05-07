@@ -1,7 +1,7 @@
-from fastapi import FastAPI, Cookie, Request, Response, HTTPException, Header, Depends
+from fastapi import FastAPI, Cookie, Request, Response, HTTPException, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Annotated, Optional
+from typing import Optional
 from datetime import datetime
 import uuid
 import time
@@ -11,14 +11,14 @@ from models import UserCreate, Product, sample_products
 
 app = FastAPI(
     title="Bookstore API",
-    description="API для управления каталогом книг и аутентификации пользователей",
+    description="API для управления каталогом книг",
 )
 
 USERS_DB = {
     "mihail": "secure1234",
     "admin": "adminpass"
 }
-active_sessions: dict = {}
+active_sessions = {}
 TOKEN_SECRET = "bookstore_secret_key_7x9"
 SESSION_TTL = 300
 SESSION_RENEW_AFTER = 180
@@ -26,6 +26,10 @@ SESSION_RENEW_AFTER = 180
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+class CommonHeaders(BaseModel):
+    user_agent: str = Header(alias="User-Agent")
+    accept_language: str = Header(alias="Accept-Language")
 
 @app.post("/create_user")
 def create_user(user: UserCreate):
@@ -49,29 +53,6 @@ def get_product(product_id: int):
             return p
     raise HTTPException(status_code=404, detail="Товар не найден")
 
-class CommonHeaders(BaseModel):
-    user_agent: str = Header(alias="User-Agent")
-    accept_language: str = Header(alias="Accept-Language")
-
-@app.get("/headers")
-def get_headers(headers: CommonHeaders = Depends()):
-    return {
-        "User-Agent": headers.user_agent,
-        "Accept-Language": headers.accept_language
-    }
-
-@app.get("/info")
-def get_info(request: Request, headers: CommonHeaders = Depends(), response: Response):
-    response.headers["X-Server-Time"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    return {
-        "message": "Добро пожаловать! Ваши заголовки успешно обработаны.",
-        "client_ip": request.client.host,
-        "headers": {
-            "User-Agent": headers.user_agent,
-            "Accept-Language": headers.accept_language,
-        }
-    }
-
 @app.post("/login")
 def login(data: LoginRequest, response: Response):
     if data.username not in USERS_DB or USERS_DB[data.username] != data.password:
@@ -84,7 +65,7 @@ def login(data: LoginRequest, response: Response):
 @app.get("/user")
 def get_user(session_token: Optional[str] = Cookie(default=None)):
     if session_token is None or session_token not in active_sessions:
-        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
+        return JSONResponse(status_code=401, content={"message": "Сессия не найдена или недействительна"})
     username = active_sessions[session_token]
     return {"username": username, "email": f"{username}@bookstore.ru"}
 
@@ -114,10 +95,10 @@ def login_signed(data: LoginRequest, response: Response):
 @app.get("/profile")
 def get_profile(session_token: Optional[str] = Cookie(default=None)):
     if session_token is None:
-        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
+        return JSONResponse(status_code=401, content={"message": "Токен отсутствует"})
     user_id = validate_token(session_token)
     if user_id is None:
-        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
+        return JSONResponse(status_code=401, content={"message": "Токен недействителен"})
     return {"user_id": user_id, "email": "user@bookstore.ru"}
 
 def build_expiring_token(user_id: str, ts: int) -> str:
@@ -144,16 +125,36 @@ def login_advanced(data: LoginRequest, response: Response):
     return {"message": "Аутентификация прошла успешно"}
 
 @app.get("/profile_advanced")
-def get_profile_advanced(session_token: Optional[str] = Cookie(default=None), response: Response = Depends()):
+def get_profile_advanced(session_token: Optional[str] = Cookie(default=None), response: Response = None):
     if session_token is None:
-        return JSONResponse(status_code=401, content={"message": "Invalid session"})
+        return JSONResponse(status_code=401, content={"message": "Токен отсутствует"})
     user_id, issued_at = validate_expiring_token(session_token)
     if user_id is None:
-        return JSONResponse(status_code=401, content={"message": "Invalid session"})
+        return JSONResponse(status_code=401, content={"message": "Токен недействителен"})
+
     elapsed = int(time.time()) - issued_at
+
     if elapsed >= SESSION_TTL:
-        return JSONResponse(status_code=401, content={"message": "Session expired"})
+        return JSONResponse(status_code=401, content={"message": "Сессия истекла, войдите снова"})
+
     if elapsed >= SESSION_RENEW_AFTER:
         new_token = build_expiring_token(user_id, int(time.time()))
         response.set_cookie(key="session_token", value=new_token, httponly=True, secure=False, max_age=SESSION_TTL)
+
     return {"user_id": user_id, "email": "user@bookstore.ru"}
+
+@app.get("/headers")
+def get_headers(headers: CommonHeaders = Header()):
+    return {"User-Agent": headers.user_agent, "Accept-Language": headers.accept_language}
+
+@app.get("/info")
+def get_info(request: Request, headers: CommonHeaders = Header(), response: Response):
+    response.headers["X-Server-Time"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    return {
+        "message": "Добро пожаловать! Ваши заголовки успешно обработаны.",
+        "client_ip": request.client.host,
+        "headers": {
+            "User-Agent": headers.user_agent,
+            "Accept-Language": headers.accept_language,
+        },
+    }
